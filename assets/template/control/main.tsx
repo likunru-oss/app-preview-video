@@ -1,0 +1,706 @@
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import {Player, type PlayerRef} from '@remotion/player';
+import {AppPreview, FPS, MOCK_NAMES, OPTIONS, newCardPage, newFeaturePage, scenesOf, totalFrames, type CardPage, type FeaturePage, type Props} from '../src/AppPreview';
+
+/* ---------- 小工具 ---------- */
+type Path = (string | number)[];
+const setIn = (obj: unknown, path: Path, value: unknown): unknown => {
+  if (path.length === 0) return value;
+  const [k, ...rest] = path;
+  if (Array.isArray(obj)) {
+    const copy = obj.slice();
+    copy[k as number] = setIn(copy[k as number], rest, value);
+    return copy;
+  }
+  const o = obj as Record<string, unknown>;
+  return {...o, [k]: setIn(o[k as string], rest, value)};
+};
+const isVideo = (f: string) => /\.(mp4|mov|webm)$/i.test(f);
+const fileUrl = (f: string) => (/^(https?:|data:)/.test(f) ? f : '/' + f);
+
+/* ---------- 基础控件 ---------- */
+const Field: React.FC<{label: string; help?: string; children: React.ReactNode}> = ({label, help, children}) => (
+  <div className="field">
+    <label>{label}</label>
+    {children}
+    {help && <div className="help">{help}</div>}
+  </div>
+);
+
+const Text: React.FC<{label: string; value: string; onChange: (v: string) => void; help?: string}> = ({label, value, onChange, help}) => (
+  <Field label={label} help={help}>
+    <input type="text" value={value} onChange={(e) => onChange(e.target.value)} />
+  </Field>
+);
+
+const Slider: React.FC<{label: string; value: number; min: number; max: number; step: number; unit?: string; onChange: (v: number) => void; help?: string}> = ({label, value, min, max, step, unit = '', onChange, help}) => (
+  <Field label={label} help={help}>
+    <div className="slider">
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} />
+      <output>
+        {value}
+        {unit}
+      </output>
+    </div>
+  </Field>
+);
+
+const Color: React.FC<{label: string; value: string; onChange: (v: string) => void}> = ({label, value, onChange}) => (
+  <Field label={label}>
+    <div className="color">
+      <input type="color" value={value} onChange={(e) => onChange(e.target.value.toUpperCase())} />
+      <span>{value}</span>
+    </div>
+  </Field>
+);
+
+// 一排可点的选项，选中的那个高亮
+const Choice: React.FC<{label: string; value: string; options: readonly string[]; onChange: (v: string) => void; help?: string}> = ({label, value, options, onChange, help}) => (
+  <Field label={label} help={help}>
+    <div className="choices">
+      {options.map((o) => (
+        <button key={o} className={'opt' + (o === value ? ' on' : '')} onClick={() => onChange(o)}>
+          {o}
+        </button>
+      ))}
+    </div>
+  </Field>
+);
+
+const Toggle: React.FC<{label: string; value: boolean; onChange: (v: boolean) => void}> = ({label, value, onChange}) => (
+  <label className="toggle">
+    <input type="checkbox" checked={value} onChange={(e) => onChange(e.target.checked)} />
+    {label}
+  </label>
+);
+
+const Sub: React.FC<{children: React.ReactNode}> = ({children}) => <div className="sub">{children}</div>;
+
+// 素材框：把图片或录屏拖进来，或者点一下选文件
+const Drop: React.FC<{label: string; value: string; onChange: (v: string) => void; video?: boolean; wide?: boolean; emptyText: string; help?: string}> = ({label, value, onChange, video, wide, emptyText, help}) => {
+  const [over, setOver] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const input = useRef<HTMLInputElement>(null);
+  const upload = async (file: File) => {
+    setBusy(true);
+    setErr('');
+    try {
+      const r = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {method: 'POST', body: file});
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || '上传失败');
+      onChange(j.file);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Field label={label} help={err || help}>
+      <div
+        className={'drop' + (over ? ' over' : '')}
+        onClick={() => input.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setOver(true);
+        }}
+        onDragLeave={() => setOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setOver(false);
+          const f = e.dataTransfer.files[0];
+          if (f) upload(f);
+        }}
+      >
+        <div className={'thumb' + (wide ? ' wide' : '')} style={value && !isVideo(value) ? {backgroundImage: `url("${fileUrl(value)}")`} : undefined}>
+          {!value ? '无' : isVideo(value) ? '录屏' : ''}
+        </div>
+        <div className="txt">
+          <b>{busy ? '正在上传…' : value ? (isVideo(value) ? '已放入录屏' : '已放入图片') : emptyText}</b>
+          <span>把{video ? '图片或录屏' : '图片'}拖到这里，或者点一下选文件</span>
+        </div>
+        {value && (
+          <button
+            className="btn small danger"
+            onClick={(e) => {
+              e.stopPropagation();
+              onChange('');
+            }}
+          >
+            移除
+          </button>
+        )}
+        <input
+          ref={input}
+          type="file"
+          hidden
+          accept={video ? 'image/png,image/jpeg,image/webp,video/mp4,video/quicktime' : 'image/png,image/jpeg,image/webp'}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) upload(f);
+            e.target.value = '';
+          }}
+        />
+      </div>
+    </Field>
+  );
+};
+
+// 高亮编辑：直接在截图上拖一个框，这块区域在视频里就会被放大
+type Spot = FeaturePage['高亮'][number];
+const Spots: React.FC<{image: string; value: Spot[]; onChange: (v: Spot[]) => void}> = ({image, value, onChange}) => {
+  const box = useRef<HTMLDivElement>(null);
+  const [draft, setDraft] = useState<{x0: number; y0: number; x1: number; y1: number} | null>(null);
+  const pos = (e: React.PointerEvent) => {
+    const r = box.current!.getBoundingClientRect();
+    return {x: Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100)), y: Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100))};
+  };
+  const rect = (d: NonNullable<typeof draft>) => ({左: Math.min(d.x0, d.x1), 上: Math.min(d.y0, d.y1), 宽: Math.abs(d.x1 - d.x0), 高: Math.abs(d.y1 - d.y0)});
+  const round = (n: number) => Math.round(n * 2) / 2;
+  return (
+    <Field label="放大讲解的区域" help="在左边的截图上按住拖出一个框。视频里手指会点这块区域，然后它放大弹出，旁边显示你填的说明。建议 2–3 个。">
+      <div className="spots">
+        <div
+          className="canvas"
+          ref={box}
+          onPointerDown={(e) => {
+            e.currentTarget.setPointerCapture(e.pointerId);
+            const p = pos(e);
+            setDraft({x0: p.x, y0: p.y, x1: p.x, y1: p.y});
+          }}
+          onPointerMove={(e) => {
+            if (!draft) return;
+            const p = pos(e);
+            setDraft({...draft, x1: p.x, y1: p.y});
+          }}
+          onPointerUp={() => {
+            if (draft) {
+              const r = rect(draft);
+              if (r.宽 > 3 && r.高 > 2) onChange([...value, {文字: '说明文字', 左: round(r.左), 上: round(r.上), 宽: round(r.宽), 高: round(r.高)}]);
+            }
+            setDraft(null);
+          }}
+        >
+          <img src={fileUrl(image)} alt="" draggable={false} />
+          {value.map((s, i) => (
+            <div key={i} className="box" style={{left: s.左 + '%', top: s.上 + '%', width: s.宽 + '%', height: s.高 + '%'}}>
+              <em>{i + 1}</em>
+            </div>
+          ))}
+          {draft && (() => {
+            const r = rect(draft);
+            return <div className="box draft" style={{left: r.左 + '%', top: r.上 + '%', width: r.宽 + '%', height: r.高 + '%'}} />;
+          })()}
+        </div>
+        <div className="list">
+          {value.length === 0 && <div className="empty">还没有区域。在截图上拖一个框试试。</div>}
+          {value.map((s, i) => (
+            <div className="item" key={i}>
+              <div className="num">{i + 1}</div>
+              <input type="text" value={s.文字} onChange={(e) => onChange(value.map((v, j) => (j === i ? {...v, 文字: e.target.value} : v)))} />
+              <button className="btn small danger" onClick={() => onChange(value.filter((_, j) => j !== i))}>
+                删除
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </Field>
+  );
+};
+
+// 在截图上框出一个位置（只保留一个框），用来告诉视频小车在哪
+type Box = {左: number; 上: number; 宽: number; 高: number};
+const BoxPicker: React.FC<{image: string; value: Box; onChange: (v: Box) => void}> = ({image, value, onChange}) => {
+  const box = useRef<HTMLDivElement>(null);
+  const [draft, setDraft] = useState<{x0: number; y0: number; x1: number; y1: number} | null>(null);
+  const pos = (e: React.PointerEvent) => {
+    const r = box.current!.getBoundingClientRect();
+    return {x: Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100)), y: Math.max(0, Math.min(100, ((e.clientY - r.top) / r.height) * 100))};
+  };
+  const rect = (d: NonNullable<typeof draft>) => ({左: Math.min(d.x0, d.x1), 上: Math.min(d.y0, d.y1), 宽: Math.abs(d.x1 - d.x0), 高: Math.abs(d.y1 - d.y0)});
+  const round = (n: number) => Math.round(n * 2) / 2;
+  const shown = draft ? rect(draft) : value;
+  return (
+    <div
+      className="canvas"
+      ref={box}
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        const p = pos(e);
+        setDraft({x0: p.x, y0: p.y, x1: p.x, y1: p.y});
+      }}
+      onPointerMove={(e) => {
+        if (!draft) return;
+        const p = pos(e);
+        setDraft({...draft, x1: p.x, y1: p.y});
+      }}
+      onPointerUp={() => {
+        if (draft) {
+          const r = rect(draft);
+          if (r.宽 > 2 && r.高 > 2) onChange({左: round(r.左), 上: round(r.上), 宽: round(r.宽), 高: round(r.高)});
+        }
+        setDraft(null);
+      }}
+    >
+      <img src={fileUrl(image)} alt="" draggable={false} />
+      <div className={'box' + (draft ? ' draft' : '')} style={{left: shown.左 + '%', top: shown.上 + '%', width: shown.宽 + '%', height: shown.高 + '%', borderColor: '#F08A24', background: 'rgba(240,138,36,.2)'}} />
+    </div>
+  );
+};
+
+/* ---------- 主界面 ---------- */
+type Job = {state: 'idle' | 'running' | 'done' | 'error'; progress: number; file: string; error: string};
+// 当前选中的页签：开场、结尾、整体风格，或者第几个页面（数字）
+type Active = 'intro' | 'end' | 'style' | number;
+
+const App = () => {
+  const [props, setProps] = useState<Props | null>(null);
+  const [active, setActive] = useState<Active>(0);
+  const [adding, setAdding] = useState(false);
+  const [saveState, setSaveState] = useState<'saved' | 'saving' | 'error'>('saved');
+  const [job, setJob] = useState<Job>({state: 'idle', progress: 0, file: '', error: ''});
+  const player = useRef<PlayerRef>(null);
+  const dirty = useRef(false);
+  const stopAt = useRef<number | null>(null);
+
+  useEffect(() => {
+    fetch('/api/props')
+      .then((r) => r.json())
+      .then(setProps);
+    fetch('/api/render')
+      .then((r) => r.json())
+      .then((j: Job) => j.state === 'running' && setJob(j));
+  }, []);
+
+  // 改动后半秒自动保存
+  useEffect(() => {
+    if (!props || !dirty.current) return;
+    setSaveState('saving');
+    const t = setTimeout(() => {
+      fetch('/api/props', {method: 'POST', body: JSON.stringify(props)})
+        .then((r) => setSaveState(r.ok ? 'saved' : 'error'))
+        .catch(() => setSaveState('error'));
+    }, 500);
+    return () => clearTimeout(t);
+  }, [props]);
+
+  // 导出进度
+  useEffect(() => {
+    if (job.state !== 'running') return;
+    const t = setInterval(() => {
+      fetch('/api/render')
+        .then((r) => r.json())
+        .then(setJob)
+        .catch(() => undefined);
+    }, 1000);
+    return () => clearInterval(t);
+  }, [job.state]);
+
+  const set = useCallback((path: Path, value: unknown) => {
+    dirty.current = true;
+    setProps((p) => setIn(p, path, value) as Props);
+  }, []);
+
+  // 每个段落从第几帧开始、有多少帧
+  const timeline = useMemo(() => {
+    if (!props) return [];
+    let n = 0;
+    return scenesOf(props).map((sc) => {
+      const start = n;
+      n += sc.frames;
+      return {...sc, start};
+    });
+  }, [props]);
+  const sceneOf = (a: Active) => timeline.find((t) => t.id === a);
+
+  // 点页签时，把视频跳到这一页里最能看出效果的那一帧
+  const peek = (a: Active) => {
+    if (!props || typeof a !== 'number') return a === 'intro' ? 30 : 45;
+    const pg = props.页面[a];
+    if (pg.类型 === '卡片页') return 60;
+    if (pg.截图) return pg.高亮.length ? 52 : 40;
+    return pg.示意 !== '无' ? 100 : 40;
+  };
+  const jump = (a: Active) => {
+    setActive(a);
+    setAdding(false);
+    const sc = sceneOf(a);
+    if (!sc) return;
+    stopAt.current = null;
+    player.current?.pause();
+    player.current?.seekTo(sc.start + Math.min(sc.frames - 1, peek(a)));
+  };
+  // 重播某一页：从上一页的结尾开始放，这样能看到转场，放完这一页自动停
+  const replay = (a: Active) => {
+    const sc = sceneOf(a);
+    const pl = player.current;
+    if (!sc || !pl) return;
+    stopAt.current = sc.start + sc.frames - (a === 'end' ? 2 : 0);
+    pl.seekTo(Math.max(0, sc.start - 12));
+    pl.play();
+  };
+
+  const ready = !!props;
+  useEffect(() => {
+    if (!ready) return;
+    let pl: PlayerRef | null = null;
+    const onFrame = (e: {detail: {frame: number}}) => {
+      if (stopAt.current !== null && e.detail.frame >= stopAt.current) {
+        stopAt.current = null;
+        pl?.pause();
+      }
+    };
+    const t = setTimeout(() => {
+      pl = player.current;
+      pl?.addEventListener('frameupdate', onFrame);
+      jump(0);
+    }, 300);
+    return () => {
+      clearTimeout(t);
+      pl?.removeEventListener('frameupdate', onFrame);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  if (!props) return <div style={{padding: 24}}>正在打开…</div>;
+  const total = totalFrames(props) / FPS;
+  const tooLong = total > 30;
+  const tooShort = total < 15;
+  const pages = props.页面;
+
+  // 改动效选项：保存，并马上重播这一页看效果
+  const fx = (a: Active, path: Path, value: unknown) => {
+    set(path, value);
+    setTimeout(() => replay(a), 60);
+  };
+
+  /* ----- 页面的增、删、移动、复制 ----- */
+  const setPages = (next: Props['页面'], goto: Active) => {
+    set(['页面'], next);
+    setActive(goto);
+    setAdding(false);
+  };
+  const addPage = (pg: Props['页面'][number]) => setPages([...pages, pg], pages.length);
+  const movePage = (i: number, dir: -1 | 1) => {
+    const j = i + dir;
+    if (j < 0 || j >= pages.length) return;
+    const next = pages.slice();
+    [next[i], next[j]] = [next[j], next[i]];
+    setPages(next, j);
+  };
+  const copyPage = (i: number) => {
+    const next = pages.slice();
+    next.splice(i + 1, 0, {...JSON.parse(JSON.stringify(pages[i])), 名称: pages[i].名称 + ' 副本'});
+    setPages(next, i + 1);
+  };
+  const removePage = (i: number) => {
+    if (!window.confirm(`删除「${pages[i].名称}」这一页？`)) return;
+    const next = pages.filter((_, j) => j !== i);
+    setPages(next, next.length ? Math.min(i, next.length - 1) : 'intro');
+  };
+
+  const pageTools = (i: number) => (
+    <>
+      <Text label="这一页的名字" value={pages[i].名称} onChange={(v) => set(['页面', i, '名称'], v)} help="只显示在上面的页签里，不会出现在视频里。" />
+      <div className="tools">
+        <button className="btn small" disabled={i === 0} onClick={() => movePage(i, -1)}>
+          ← 往前移
+        </button>
+        <button className="btn small" disabled={i === pages.length - 1} onClick={() => movePage(i, 1)}>
+          往后移 →
+        </button>
+        <button className="btn small" onClick={() => copyPage(i)}>
+          复制这一页
+        </button>
+        <button className="btn small danger" onClick={() => removePage(i)}>
+          删除这一页
+        </button>
+      </div>
+    </>
+  );
+
+  const featureBody = (i: number, p: FeaturePage) => {
+    const at = (key: string): Path => ['页面', i, key];
+    const hasImage = !!p.截图 && !isVideo(p.截图);
+    return (
+      <>
+        {pageTools(i)}
+        <Sub>内容</Sub>
+        <div className="row2">
+          <Text label="大字第一行" value={p.第一行} onChange={(v) => set(at('第一行'), v)} />
+          <Text label="大字第二行" value={p.第二行} onChange={(v) => set(at('第二行'), v)} />
+        </div>
+        <Drop label="手机里的画面" value={p.截图} video onChange={(v) => set(at('截图'), v)} emptyText={p.示意 !== '无' ? '现在是示意动画' : '还没有画面'} help="放 App 的截图（png / jpg）或录屏（mp4 / mov）。" />
+        {!p.截图 && MOCK_NAMES.length > 1 && (
+          <Choice label="没放素材时显示什么" value={p.示意} options={MOCK_NAMES} onChange={(v) => fx(i, at('示意'), v)} help="示意动画是画出来的，不是 App 真实界面，只能临时占位，不能用于提交。" />
+        )}
+        {hasImage && <Spots image={p.截图} value={p.高亮} onChange={(v) => set(at('高亮'), v)} />}
+        <Slider label="这一页停留多久" value={p.时长} min={1.5} max={8} step={0.5} unit=" 秒" onChange={(v) => set(at('时长'), v)} />
+
+        <Sub>这一页怎么出现</Sub>
+        <Choice label="进场转场" value={p.转场} options={OPTIONS.转场} onChange={(v) => fx(i, at('转场'), v)} help="这一页盖住上一页的方式。" />
+        <Choice label="背景配色" value={p.配色} options={OPTIONS.配色} onChange={(v) => fx(i, at('配色'), v)} />
+        <Choice label="大字的动画" value={p.标题动画} options={OPTIONS.标题动画} onChange={(v) => fx(i, at('标题动画'), v)} />
+
+        <Sub>手机怎么动</Sub>
+        <Choice label="手机进场" value={p.手机进场} options={OPTIONS.手机进场} onChange={(v) => fx(i, at('手机进场'), v)} />
+        <Choice label="进场后的动态" value={p.手机动态} options={OPTIONS.手机动态} onChange={(v) => fx(i, at('手机动态'), v)} />
+
+        {hasImage && (
+          <>
+            <Sub>讲解区域怎么展示</Sub>
+            <Choice
+              label="讲解效果"
+              value={p.讲解效果}
+              options={OPTIONS.讲解效果}
+              onChange={(v) => fx(i, at('讲解效果'), v)}
+              help="放大弹出：区域抠出来浮在手机上。镜头推近：整个屏幕朝那块区域放大。描边闪烁：不放大，原位置出现发光的框。"
+            />
+            <Slider label="每个区域停留多久" value={p.讲解停留} min={0.6} max={2.5} step={0.1} unit=" 秒" onChange={(v) => set(at('讲解停留'), v)} help="区域多、停留久时，记得把这一页的总时长也加长。" />
+            <div className="toggles">
+              <Toggle label="显示手指点击" value={p.显示手指} onChange={(v) => fx(i, at('显示手指'), v)} />
+              <Toggle label="讲解时压暗其余部分" value={p.压暗背景} onChange={(v) => fx(i, at('压暗背景'), v)} />
+            </div>
+
+            <Sub>画面里的小车</Sub>
+            <div className="toggles">
+              <Toggle label="让小车沿路线往前开" value={p.小车.开启} onChange={(v) => fx(i, at('小车'), {...p.小车, 开启: v})} />
+            </div>
+            {p.小车.开启 && (
+              <>
+                <Slider label="往前开多远" value={p.小车.距离} min={5} max={40} step={1} unit="%" help="占屏幕高度的百分比。数字越大开得越远，也就越快。" onChange={(v) => set([...at('小车'), '距离'], v)} />
+                <Choice label="行驶方式" value={p.小车.方式} options={OPTIONS.行驶方式} onChange={(v) => fx(i, at('小车'), {...p.小车, 方式: v})} />
+                <div className="toggles">
+                  <Toggle label="开过的路线变灰" value={p.小车.变灰轨迹} onChange={(v) => fx(i, at('小车'), {...p.小车, 变灰轨迹: v})} />
+                </div>
+                <Field label="小车在截图上的位置" help="橙色框要刚好框住小车。换了截图后，在图上重新拖一个框。只适合直线路段。">
+                  <BoxPicker image={p.截图} value={p.小车} onChange={(b) => fx(i, at('小车'), {...p.小车, ...b})} />
+                </Field>
+              </>
+            )}
+          </>
+        )}
+
+        <Sub>画面上的提示</Sub>
+        <div className="toggles">
+          <Toggle label="在手机画面上弹出两条提示（先红后绿）" value={p.提示.开启} onChange={(v) => fx(i, at('提示'), {...p.提示, 开启: v})} />
+        </div>
+        {p.提示.开启 && (
+          <div className="row2">
+            <Text label="先弹出的红色提示" value={p.提示.红色文字} onChange={(v) => set([...at('提示'), '红色文字'], v)} />
+            <Text label="随后的绿色提示" value={p.提示.绿色文字} onChange={(v) => set([...at('提示'), '绿色文字'], v)} />
+          </div>
+        )}
+      </>
+    );
+  };
+
+  const cardBody = (i: number, p: CardPage) => {
+    const at = (key: string): Path => ['页面', i, key];
+    return (
+      <>
+        {pageTools(i)}
+        <Sub>内容</Sub>
+        <div className="row2">
+          <Text label="大字第一行" value={p.第一行} onChange={(v) => set(at('第一行'), v)} />
+          <Text label="大字第二行" value={p.第二行} onChange={(v) => set(at('第二行'), v)} />
+        </div>
+        <Field label="卡片" help="最多 6 张。右边的滑块是卡片颜色。">
+          {p.卡片.map((c, j) => (
+            <div className="item" key={j}>
+              <div className="swatch" style={{background: `linear-gradient(135deg, hsl(${c.色相},70%,62%), hsl(${c.色相 + 40},75%,45%))`}} />
+              <input type="text" value={c.文字} onChange={(e) => set([...at('卡片'), j, '文字'], e.target.value)} />
+              <input type="range" min={0} max={360} step={5} value={c.色相} onChange={(e) => set([...at('卡片'), j, '色相'], Number(e.target.value))} />
+              <button className="btn small danger" onClick={() => set(at('卡片'), p.卡片.filter((_, n) => n !== j))}>
+                删除
+              </button>
+            </div>
+          ))}
+          {p.卡片.length < 6 && (
+            <button className="btn small" onClick={() => set(at('卡片'), [...p.卡片, {文字: 'NEW', 图片: '', 色相: (p.卡片.length * 70) % 360}])}>
+              + 加一张卡片
+            </button>
+          )}
+        </Field>
+        <Slider label="这一页停留多久" value={p.时长} min={2} max={6} step={0.5} unit=" 秒" onChange={(v) => set(at('时长'), v)} />
+        <Sub>这一页怎么出现</Sub>
+        <Choice label="进场转场" value={p.转场} options={OPTIONS.转场} onChange={(v) => fx(i, at('转场'), v)} />
+        <Choice label="背景配色" value={p.配色} options={OPTIONS.配色} onChange={(v) => fx(i, at('配色'), v)} />
+        <Choice label="大字的动画" value={p.标题动画} options={OPTIONS.标题动画} onChange={(v) => fx(i, at('标题动画'), v)} />
+        <Choice label="卡片怎么出现" value={p.卡片动画} options={OPTIONS.卡片动画} onChange={(v) => fx(i, at('卡片动画'), v)} />
+      </>
+    );
+  };
+
+  const body = () => {
+    if (active === 'style')
+      return (
+        <>
+          <div className="row2">
+            <Color label="主色" value={props.品牌.主色} onChange={(v) => set(['品牌', '主色'], v)} />
+            <Color label="深色" value={props.品牌.深色} onChange={(v) => set(['品牌', '深色'], v)} />
+          </div>
+          <Color label="浅色背景" value={props.品牌.背景色} onChange={(v) => set(['品牌', '背景色'], v)} />
+          <Slider label="大字的大小" value={props.样式.标题字号} min={60} max={120} step={2} onChange={(v) => set(['样式', '标题字号'], v)} />
+          <Slider label="手机的大小" value={props.样式.手机宽度} min={480} max={720} step={10} onChange={(v) => set(['样式', '手机宽度'], v)} />
+          <Slider label="动画的弹跳感" value={props.样式.弹跳感} min={0} max={10} step={1} help="0 是平稳滑入，10 是很有弹性。" onChange={(v) => set(['样式', '弹跳感'], v)} />
+          <Slider label="音效音量" value={props.样式.音效音量} min={0} max={1} step={0.05} help="0 是静音。点播放才能听到声音。" onChange={(v) => set(['样式', '音效音量'], v)} />
+        </>
+      );
+    if (active === 'intro')
+      return (
+        <>
+          <Drop label="App 图标" value={props.品牌.图标} onChange={(v) => set(['品牌', '图标'], v)} emptyText="还没有图标" help="建议用透明底的 PNG。" />
+          <Slider label="图标大小" value={props.开场.图标大小} min={160} max={460} step={10} onChange={(v) => set(['开场', '图标大小'], v)} />
+          <Choice label="图标怎么出现" value={props.开场.图标动画} options={OPTIONS.图标动画} onChange={(v) => fx('intro', ['开场', '图标动画'], v)} />
+          <Slider label="这一页停留多久" value={props.开场.时长} min={1} max={4} step={0.5} unit=" 秒" onChange={(v) => set(['开场', '时长'], v)} />
+        </>
+      );
+    if (active === 'end')
+      return (
+        <>
+          <Drop label="带文字的 Logo" value={props.品牌.字标} wide onChange={(v) => set(['品牌', '字标'], v)} emptyText="还没有 Logo" />
+          <Slider label="Logo 宽度" value={props.结尾.字标宽度} min={360} max={800} step={10} onChange={(v) => set(['结尾', '字标宽度'], v)} />
+          <Text label="Logo 下面的一句话" value={props.品牌.标语} onChange={(v) => set(['品牌', '标语'], v)} />
+          <Slider label="这一页停留多久" value={props.结尾.时长} min={1.5} max={5} step={0.5} unit=" 秒" onChange={(v) => set(['结尾', '时长'], v)} />
+          <Sub>这一页怎么出现</Sub>
+          <Choice label="进场转场" value={props.结尾.转场} options={OPTIONS.转场} onChange={(v) => fx('end', ['结尾', '转场'], v)} />
+          <Choice label="Logo 怎么出现" value={props.结尾.标志动画} options={OPTIONS.标志动画} onChange={(v) => fx('end', ['结尾', '标志动画'], v)} />
+        </>
+      );
+    const pg = pages[active];
+    if (!pg) return <div className="empty">这一页不存在了，请在上面重新选一页。</div>;
+    return pg.类型 === '功能页' ? featureBody(active, pg) : cardBody(active, pg);
+  };
+
+  const title = active === 'style' ? '整体风格' : active === 'intro' ? '开场' : active === 'end' ? '结尾' : (pages[active]?.名称 ?? '');
+  const desc =
+    active === 'style'
+      ? '这里的设置对所有页面生效。'
+      : active === 'intro'
+        ? '视频最开始，App 图标出现。'
+        : active === 'end'
+          ? 'Logo 和一句标语。'
+          : pages[active]?.类型 === '卡片页'
+            ? '大字加一组卡片，适合一次列出多个卖点。'
+            : '大字加一台手机，手机里放 App 的截图或录屏。';
+
+  return (
+    <div className="app">
+      <div className="top">
+        <h1>预览视频控制台</h1>
+        <span className="meta" style={tooLong || tooShort ? {color: 'var(--red)', fontWeight: 600} : undefined}>
+          总长 {total.toFixed(1)} 秒{tooLong ? '（超过 App Store 的 30 秒上限）' : tooShort ? '（不到 App Store 要求的 15 秒）' : ''}
+        </span>
+        <span className="meta">{saveState === 'saving' ? '正在保存…' : saveState === 'error' ? '保存失败' : '改动已自动保存'}</span>
+        <div className="grow" />
+        <button
+          className="btn"
+          onClick={() => {
+            if (!window.confirm('把所有内容恢复成最初的样子？你上传的素材文件不会被删除。')) return;
+            fetch('/api/reset', {method: 'POST'})
+              .then((r) => r.json())
+              .then((p) => {
+                dirty.current = false;
+                setProps(p);
+                setActive('intro');
+                setSaveState('saved');
+              });
+          }}
+        >
+          恢复默认
+        </button>
+        <button
+          className="btn primary"
+          disabled={job.state === 'running' || saveState === 'saving'}
+          onClick={() =>
+            fetch('/api/render', {method: 'POST'})
+              .then((r) => r.json())
+              .then(setJob)
+          }
+        >
+          {job.state === 'running' ? '正在导出…' : '导出视频'}
+        </button>
+      </div>
+      {job.state === 'running' && (
+        <div className="banner run">
+          正在导出视频，大约需要 1 分钟，期间可以继续看但先不要改内容。{Math.round(job.progress * 100)}%
+          <div className="bar">
+            <i style={{width: job.progress * 100 + '%'}} />
+          </div>
+        </div>
+      )}
+      {job.state === 'done' && <div className="banner ok">导出完成，视频在：{job.file}</div>}
+      {job.state === 'error' && <div className="banner err">导出失败：{job.error}</div>}
+
+      <div className="pages">
+        <button className={'chip' + (active === 'intro' ? ' on' : '')} onClick={() => jump('intro')}>
+          <b>开场</b>
+          <span>{props.开场.时长} 秒</span>
+        </button>
+        {pages.map((pg, i) => (
+          <button key={i} className={'chip' + (active === i ? ' on' : '')} onClick={() => jump(i)}>
+            <b>
+              {i + 1}. {pg.名称 || '未命名'}
+            </b>
+            <span>
+              {pg.时长} 秒 · {pg.类型}
+            </span>
+          </button>
+        ))}
+        <button className={'chip' + (active === 'end' ? ' on' : '')} onClick={() => jump('end')}>
+          <b>结尾</b>
+          <span>{props.结尾.时长} 秒</span>
+        </button>
+        {adding ? (
+          <div className="chip addbox">
+            <button className="btn small" onClick={() => addPage(newFeaturePage())}>
+              功能页（手机画面）
+            </button>
+            <button className="btn small" onClick={() => addPage(newCardPage())}>
+              卡片页
+            </button>
+            <button className="btn small" onClick={() => setAdding(false)}>
+              取消
+            </button>
+          </div>
+        ) : (
+          <button className="chip add" onClick={() => setAdding(true)}>
+            <b>+ 加一页</b>
+            <span>加在结尾之前</span>
+          </button>
+        )}
+        <button className={'chip style' + (active === 'style' ? ' on' : '')} onClick={() => jump('style')}>
+          <b>整体风格</b>
+          <span>颜色 · 字号 · 音量</span>
+        </button>
+      </div>
+
+      <div className="main">
+        <div className="stage">
+          <div className="frame">
+            <Player ref={player} component={AppPreview} inputProps={props} durationInFrames={Math.max(1, totalFrames(props))} fps={FPS} compositionWidth={886} compositionHeight={1920} style={{width: '100%'}} controls loop acknowledgeRemotionLicense numberOfSharedAudioTags={16} />
+          </div>
+          {active !== 'style' && (
+            <button className="btn" onClick={() => replay(active)}>
+              ▶ 重播这一页
+            </button>
+          )}
+          <div className="hint">点上面的页签会跳到那一页。改动画选项后会自动重播这一页。</div>
+        </div>
+        <div className="panel">
+          <div className="card">
+            <h2>{title}</h2>
+            <p className="desc">{desc}</p>
+            {body()}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+createRoot(document.getElementById('root')!).render(<App />);
