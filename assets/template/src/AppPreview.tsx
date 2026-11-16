@@ -1,7 +1,8 @@
 import React from 'react';
-import {AbsoluteFill, Audio, Easing, Img, OffthreadVideo, Sequence, interpolate, spring, staticFile, useCurrentFrame} from 'remotion';
+import {AbsoluteFill, Audio, Easing, Freeze, Img, OffthreadVideo, Sequence, interpolate, spring, staticFile, useCurrentFrame} from './engine';
 import {z} from 'zod';
-import {zColor} from '@remotion/zod-types';
+// 颜色字段：一个颜色字符串（如 #1787CE）
+const zColor = () => z.string();
 
 /* ========= 可调内容的定义 =========
    视频 = 开场 + 任意多个页面 + 结尾。页面有两种：功能页（标题 + 手机画面）和卡片页（标题 + 一组卡片）。
@@ -23,6 +24,8 @@ const 图标动画 = z.enum(['旋转弹出', '从上落下', '放大淡入', '�
 const 卡片动画 = z.enum(['两侧飞入', '原地弹出', '从上落下', '翻牌']);
 const 标志动画 = z.enum(['弹出', '放大淡入', '从下升起']);
 const 行驶方式 = z.enum(['匀速', '缓起缓停', '走走停停']);
+const 车辆运动 = z.enum(['车不动，地图移动', '地图不动，车往前开']);
+const 切换效果 = z.enum(['淡入淡出', '向左滑动', '向上滑动', '放大切换']);
 export const OPTIONS = {
   转场: 转场.options,
   配色: 配色.options,
@@ -34,6 +37,8 @@ export const OPTIONS = {
   卡片动画: 卡片动画.options,
   标志动画: 标志动画.options,
   行驶方式: 行驶方式.options,
+  车辆运动: 车辆运动.options,
+  切换效果: 切换效果.options,
 };
 
 const 功能页 = z.object({
@@ -63,10 +68,34 @@ const 功能页 = z.object({
     高: 百分比,
     距离: z.number().min(5).max(40).step(1), // 往前开多远，占屏幕高度的百分比
     方式: 行驶方式,
-    变灰轨迹: z.boolean(), // 开过的路线是否变成灰色
+    变灰轨迹: z.boolean(), // 车身后开过的路线是否显示成灰色
+    // 「车不动，地图移动」像真实导航：车停在原位，前方的地图朝车移动。旧设置没有这一项时按「车往前开」处理
+    模式: 车辆运动.optional(),
+    // 会移动的地图范围（百分比）。不填就按小车位置自动算：车头前方、左右各留一段
+    地图区域: z.object({左: 百分比, 上: 百分比, 宽: 百分比, 高: 百分比}).optional(),
+    // 不跟着地图动的卡片、按钮（百分比）。标了以后，地图区域默认变成整个屏幕宽
+    固定元素: z.array(z.object({左: 百分比, 上: 百分比, 宽: 百分比, 高: 百分比})).optional(),
   }),
   // 在画面上先弹出一条红色提示，再换成一条绿色提示（比如「无信号」→「离线地图」）
   提示: z.object({开启: z.boolean(), 红色文字: z.string(), 绿色文字: z.string()}),
+  // 录屏怎么播：从第几秒开始、几倍速。长度是录屏总长（秒），控制台读到后自动填，0 = 还不知道
+  录屏: z
+    .object({
+      开始: z.number().min(0).max(600).step(0.1),
+      速度: z.number().min(0.25).max(4).step(0.25),
+      长度: z.number().min(0),
+    })
+    .optional(),
+  // 尾帧：手机画面播到一半切换成第二张图（操作前 → 操作后）。没有图片时不切换
+  尾帧: z
+    .object({
+      图片: 图片,
+      切换: 切换效果,
+      切换时间: z.number().min(0.5).max(7.5).step(0.5), // 这一页开始后第几秒切换
+      先点击: z.boolean(), // 切换前先显示一次手指点击
+      点击位置: z.object({左: 百分比, 上: 百分比}), // 手指点在首帧截图的哪里（百分比）
+    })
+    .optional(),
 });
 const 卡片页 = z.object({
   类型: z.literal('卡片页'),
@@ -110,8 +139,7 @@ export const FPS = 30;
 const OVERLAP = 20; // 每页多留 20 帧，等下一页的转场盖住它
 const W = 886;
 const H = 1920;
-// Mac 上是 SF，Windows 上是 Segoe UI。想要两边完全一致，换成随工程打包的字体
-const FONT = '-apple-system, "SF Pro Display", "Segoe UI", "Helvetica Neue", Arial, sans-serif';
+const FONT = '-apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif';
 
 // 一条视频里的所有段落，按顺序：开场、各个页面、结尾
 export type Scene = {id: 'intro' | 'end' | number; name: string; frames: number};
@@ -121,6 +149,34 @@ export const scenesOf = (p: Props): Scene[] => [
   {id: 'end', name: '结尾', frames: Math.round(p.结尾.时长 * FPS)},
 ];
 export const totalFrames = (p: Props) => scenesOf(p).reduce((n, s) => n + s.frames, 0);
+
+// 小车设置补全：旧设置里没有的项用默认值
+export type Truck = FeaturePage['小车'];
+export const mapAreaOf = (t: Truck) => {
+  if (t.地图区域) return t.地图区域;
+  if (t.固定元素?.length) {
+    // 标了卡片：整屏宽、一直到屏幕底部（底部信息栏要标成不动）
+    const 上 = Math.max(0, Math.min(t.上 - 5, 19));
+    return {左: 0, 上, 宽: 100, 高: 100 - 上};
+  }
+  const cx = t.左 + t.宽 / 2;
+  const 左 = Math.max(0, cx - 16);
+  const 上 = Math.max(0, Math.min(t.上 - 5, 19));
+  return {左, 上, 宽: Math.min(100 - 左, 32), 高: t.上 + t.高 - 上};
+};
+
+// 录屏的初始设置
+export type Recording = NonNullable<FeaturePage['录屏']>;
+export const recOf = (p: {录屏?: FeaturePage['录屏']}): Recording => ({开始: 0, 速度: 1, 长度: 0, ...(p.录屏 ?? {})});
+// 录屏按当前设置能播多少秒；不知道长度时返回 Infinity
+export const recPlayableSeconds = (r: Recording) => (r.长度 > 0 ? Math.max(0, r.长度 - r.开始) / r.速度 : Infinity);
+
+// 尾帧的初始设置；旧的设置文件里没有这一项时也用它
+export type EndFrame = NonNullable<FeaturePage['尾帧']>;
+export const newEndFrame = (): EndFrame => ({图片: '', 切换: '淡入淡出', 切换时间: 2, 先点击: true, 点击位置: {左: 50, 上: 80}});
+export const endFrameOf = (p: FeaturePage): EndFrame => ({...newEndFrame(), ...(p.尾帧 ?? {})});
+// 尾帧在这一页的第几帧开始切换（至少留半秒给切换后的画面）
+export const endSwitchFrame = (e: EndFrame, dur: number) => Math.max(6, Math.min(Math.round(e.切换时间 * FPS), dur - 15));
 
 // 控制台「加一页」时用的初始内容
 export const newFeaturePage = (): FeaturePage => ({
@@ -141,8 +197,9 @@ export const newFeaturePage = (): FeaturePage => ({
   显示手指: true,
   压暗背景: true,
   讲解停留: 1,
-  小车: {开启: false, 左: 46, 上: 69, 宽: 8, 高: 7.5, 距离: 18, 方式: '匀速', 变灰轨迹: true},
+  小车: {开启: false, 左: 46, 上: 69, 宽: 8, 高: 7.5, 距离: 18, 方式: '匀速', 变灰轨迹: true, 模式: '车不动，地图移动'},
   提示: {开启: false, 红色文字: 'No signal', 绿色文字: 'Offline map'},
+  尾帧: newEndFrame(),
 });
 export const newCardPage = (): CardPage => ({
   类型: '卡片页',
@@ -368,8 +425,35 @@ const SpotLabel: React.FC<{spot: Spot; k: number; s: number; iw: number; ih: num
   );
 };
 
+// 手机屏幕里的画面：截图，或录屏（按设置的起点和速度播放，播完停在最后一帧）
+const ScreenMedia: React.FC<{url: string; isVideo: boolean; rec: Recording; style: React.CSSProperties}> = ({url, isVideo, rec, style}) => {
+  const frame = useCurrentFrame();
+  if (!isVideo) return <Img src={url} style={{objectFit: 'cover', objectPosition: 'top', ...style}} />;
+  const playable = recPlayableSeconds(rec);
+  const last = Number.isFinite(playable) ? Math.max(0, Math.floor(playable * FPS) - 2) : Infinity;
+  const video = (
+    <OffthreadVideo
+      src={url}
+      muted
+      trimBefore={Math.round(rec.开始 * FPS)}
+      playbackRate={rec.速度}
+      style={{objectFit: 'cover', objectPosition: 'top', ...style}}
+    />
+  );
+  return frame > last ? <Freeze frame={last}>{video}</Freeze> : video;
+};
+
 // 讲解效果 1「放大弹出」：把这块区域抠出来放大，浮在手机上面
-const SpotPop: React.FC<{spot: Spot; i: number; tm: SpotTiming; url: string; iw: number; ih: number}> = ({spot, i, tm, url, iw, ih}) => {
+const SpotPop: React.FC<{spot: Spot; i: number; tm: SpotTiming; url: string; isVideo: boolean; rec: Recording; iw: number; ih: number}> = ({
+  spot,
+  i,
+  tm,
+  url,
+  isVideo,
+  rec,
+  iw,
+  ih,
+}) => {
   const k = useSpotK(i, tm);
   if (k < 0.01) return null;
   const rw = (spot.宽 / 100) * iw;
@@ -396,7 +480,7 @@ const SpotPop: React.FC<{spot: Spot; i: number; tm: SpotTiming; url: string; iw:
           opacity: Math.min(1, k * 4),
         }}
       >
-        <Img src={url} style={{position: 'absolute', left: -l, top: -t, width: iw, height: ih, maxWidth: 'none'}} />
+        <ScreenMedia url={url} isVideo={isVideo} rec={rec} style={{position: 'absolute', left: -l, top: -t, width: iw, height: ih, maxWidth: 'none'}} />
       </div>
       <SpotLabel spot={spot} k={k} s={s} iw={iw} ih={ih} />
     </>
@@ -438,16 +522,139 @@ const SpotDim: React.FC<{n: number; tm: SpotTiming}> = ({n, tm}) => {
 };
 
 // 小车行驶：把小车从截图上抠出来往前移动，原位置和开过的路段用旁边的路线补上
-type Truck = FeaturePage['小车'];
-const TruckDrive: React.FC<{url: string; iw: number; ih: number; cfg: Truck; dur: number}> = ({url, iw, ih, cfg, dur}) => {
+const TruckDrive: React.FC<{url: string; iw: number; ih: number; cfg: Truck; dur: number}> = (props) =>
+  props.cfg.模式 === '车不动，地图移动' ? <MapScroll {...props} /> : <TruckMove {...props} />;
+
+// 行驶进度 0 → 1，三种节奏
+const useDriveProgress = (cfg: Truck, dur: number) => {
   const frame = useCurrentFrame();
   const end = Math.max(30, dur - 5);
-  const p =
-    cfg.方式 === '匀速'
-      ? interpolate(frame, [12, end], [0, 1], clamp)
-      : cfg.方式 === '缓起缓停'
-        ? interpolate(frame, [12, end], [0, 1], {...clamp, easing: Easing.inOut(Easing.cubic)})
-        : interpolate(frame, [12, 12 + (end - 12) * 0.38, 12 + (end - 12) * 0.6, end], [0, 0.5, 0.5, 1], {...clamp, easing: Easing.inOut(Easing.quad)});
+  return cfg.方式 === '匀速'
+    ? interpolate(frame, [12, end], [0, 1], clamp)
+    : cfg.方式 === '缓起缓停'
+      ? interpolate(frame, [12, end], [0, 1], {...clamp, easing: Easing.inOut(Easing.cubic)})
+      : interpolate(frame, [12, 12 + (end - 12) * 0.38, 12 + (end - 12) * 0.6, end], [0, 0.5, 0.5, 1], {...clamp, easing: Easing.inOut(Easing.quad)});
+};
+
+// 「车不动，地图移动」：车头前方那一块地图整体往下移，车和两边的卡片不动。
+// 地图块里先把车抹掉（用车头前方的一小段路线拉长盖住），顶部新露出的部分用最上面一行像素拉长补上，左右两边渐隐到静止的地图里
+const MapScroll: React.FC<{url: string; iw: number; ih: number; cfg: Truck; dur: number}> = ({url, iw, ih, cfg, dur}) => {
+  const p = useDriveProgress(cfg, dur);
+  const a = mapAreaOf(cfg);
+  const al = (a.左 / 100) * iw;
+  const at = (a.上 / 100) * ih;
+  const aw = (a.宽 / 100) * iw;
+  const ah = (a.高 / 100) * ih;
+  const tl = (cfg.左 / 100) * iw;
+  const tt = (cfg.上 / 100) * ih;
+  const tw = (cfg.宽 / 100) * iw;
+  const th = (cfg.高 / 100) * ih;
+  const d = p * (cfg.距离 / 100) * ih;
+  const stripH = 0.008 * ih;
+  // 把截图里 y = srcY 开始的一条像素拉长，填到 (left, top, width, height)；坐标都相对 origin
+  const stretch = (left: number, top: number, width: number, height: number, srcY: number, ox: number, oy: number) => {
+    const K = height / stripH;
+    return (
+      <div style={{position: 'absolute', left, top, width, height, overflow: 'hidden'}}>
+        <Img src={url} style={{position: 'absolute', left: -(left + ox), top: -srcY * K + 0, width: iw, height: ih * K, maxWidth: 'none'}} />
+      </div>
+    );
+  };
+  // 碰到屏幕边的那一侧不渐隐
+  const fl = a.左 <= 1 ? '#000' : 'transparent';
+  const fr = a.左 + a.宽 >= 99 ? '#000' : 'transparent';
+  const fade = `linear-gradient(to right, ${fl}, #000 ${a.左 <= 1 ? 0 : 30}%, #000 ${a.左 + a.宽 >= 99 ? 100 : 70}%, ${fr})`;
+  const fixed = cfg.固定元素 ?? [];
+  // 车尾以下、移动地图范围以内的高度（灰色路线要盖住这一段）
+  const trailH = Math.max(0, at + ah - (tt + th * 0.6));
+  // 找一条干净的地图（不碰任何卡片、也不碰车）：先往上找，再往下找，单位是百分比
+  const blockers = [...fixed, {左: cfg.左, 上: cfg.上, 宽: cfg.宽, 高: cfg.高}];
+  const cleanRow = (b: {左: number; 上: number; 宽: number; 高: number}) => {
+    const hits = (y: number) => blockers.some((o) => o.左 < b.左 + b.宽 && o.左 + o.宽 > b.左 && y + 1 > o.上 - 0.3 && y < o.上 + o.高 + 0.3);
+    for (let y = b.上 - 1.2; y >= a.上 + 0.2; y -= 0.5) if (!hits(y)) return y;
+    for (let y = b.上 + b.高 + 0.4; y <= a.上 + a.高 - 1; y += 0.5) if (!hits(y)) return y;
+    return a.上;
+  };
+  // 顶部新露出来的地图：从上往下找第一条整行都不碰卡片的地图，拉长补上
+  const fillRow = (() => {
+    for (let y = a.上; y <= a.上 + a.高 - 1; y += 0.5)
+      if (!fixed.some((o) => o.左 < a.左 + a.宽 && o.左 + o.宽 > a.左 && y + 1 > o.上 - 0.3 && y < o.上 + o.高 + 0.3)) return y;
+    return a.上;
+  })();
+  // 找一条竖着的干净地图（同样不碰卡片和车）：先往右找，再往左找；找不到返回 null
+  const cleanCol = (b: {左: number; 上: number; 宽: number; 高: number}) => {
+    const hits = (x: number) => blockers.some((o) => o.上 < b.上 + b.高 && o.上 + o.高 > b.上 && x + 1 > o.左 - 0.3 && x < o.左 + o.宽 + 0.3);
+    for (let x = b.左 + b.宽 + 0.4; x <= a.左 + a.宽 - 1; x += 0.5) if (!hits(x)) return x;
+    for (let x = b.左 - 1.2; x >= a.左 + 0.2; x -= 0.5) if (!hits(x)) return x;
+    return null;
+  };
+  // 移动的地图里先把卡片抹掉。优先用卡片旁边的一条竖着的地图横向拉长盖住，这样横穿卡片的马路能连起来；
+  // 旁边找不到（比如占满整行的底栏）才用上方或下方的一条横着的地图竖向拉长
+  const erase = (b: {左: number; 上: number; 宽: number; 高: number}, k: number) => {
+    const bl = (b.左 / 100) * iw;
+    const bt = (b.上 / 100) * ih;
+    const bw = (b.宽 / 100) * iw;
+    const bh = (b.高 / 100) * ih;
+    const col = cleanCol(b);
+    if (col !== null) {
+      const stripW = 0.008 * iw;
+      const K = bw / stripW;
+      const srcX = (col / 100) * iw;
+      return (
+        <div key={k} style={{position: 'absolute', left: bl - al, top: bt - at, width: bw, height: bh, overflow: 'hidden'}}>
+          <Img src={url} style={{position: 'absolute', left: -srcX * K, top: -bt, width: iw * K, height: ih, maxWidth: 'none'}} />
+        </div>
+      );
+    }
+    const src = (cleanRow(b) / 100) * ih;
+    return <React.Fragment key={k}>{stretch(bl - al, bt - at, bw, bh, src, al, at)}</React.Fragment>;
+  };
+  return (
+    <>
+      <div style={{position: 'absolute', left: al, top: at, width: aw, height: ah, overflow: 'hidden', WebkitMaskImage: fade, maskImage: fade}}>
+        <div style={{position: 'absolute', left: 0, top: d, width: aw, height: ah}}>
+          <Img src={url} style={{position: 'absolute', left: -al, top: -at, width: iw, height: ih, maxWidth: 'none'}} />
+          {stretch(tl - al, tt - at - 0.01 * ih, tw, th + 0.02 * ih, tt - 0.03 * ih, al, at)}
+          {fixed.map(erase)}
+        </div>
+        {d > 0.5 && stretch(0, 0, aw, d + 1, (fillRow / 100) * ih, al, at)}
+      </div>
+      {cfg.变灰轨迹 && trailH > 1 && (
+        // 车身后的路线：用车尾紧挨着的一小段灰色路线拉长，盖住从车下面滑过去的地图上的路线
+        <div style={{position: 'absolute', left: tl + tw * 0.375, top: tt + th * 0.6, width: tw * 0.25, height: trailH, overflow: 'hidden'}}>
+          <Img
+            src={url}
+            style={{
+              position: 'absolute',
+              left: -(tl + tw * 0.375),
+              top: -(tt + th + 0.012 * ih) * (trailH / stripH),
+              width: iw,
+              height: ih * (trailH / stripH),
+              maxWidth: 'none',
+            }}
+          />
+        </div>
+      )}
+      {fixed.map((b, k) => {
+        const bl = (b.左 / 100) * iw;
+        const bt = (b.上 / 100) * ih;
+        return (
+          <div key={k} style={{position: 'absolute', left: bl, top: bt, width: (b.宽 / 100) * iw, height: (b.高 / 100) * ih, overflow: 'hidden'}}>
+            <Img src={url} style={{position: 'absolute', left: -bl, top: -bt, width: iw, height: ih, maxWidth: 'none'}} />
+          </div>
+        );
+      })}
+      <div style={{position: 'absolute', left: tl, top: tt, width: tw, height: th, overflow: 'hidden'}}>
+        <Img src={url} style={{position: 'absolute', left: -tl, top: -tt, width: iw, height: ih, maxWidth: 'none'}} />
+      </div>
+    </>
+  );
+};
+
+// 「地图不动，车往前开」
+const TruckMove: React.FC<{url: string; iw: number; ih: number; cfg: Truck; dur: number}> = ({url, iw, ih, cfg, dur}) => {
+  const frame = useCurrentFrame();
+  const p = useDriveProgress(cfg, dur);
   const bl = (cfg.左 / 100) * iw;
   const bt = (cfg.上 / 100) * ih;
   const bw = (cfg.宽 / 100) * iw;
@@ -496,6 +703,8 @@ type PhoneFx = {
   压暗背景: boolean;
   讲解停留: number;
   小车: Truck;
+  尾帧?: FeaturePage['尾帧'];
+  录屏?: FeaturePage['录屏'];
 };
 const Phone: React.FC<{
   src: string;
@@ -517,7 +726,13 @@ const Phone: React.FC<{
   const url = resolveSrc(src);
   const isVideo = /\.(mp4|mov|webm)$/i.test(src.trim());
   const tm = spotTiming(fx.讲解停留);
-  const useSpots = !!url && !isVideo && spots.length > 0;
+  const end = endFrameOf({尾帧: fx.尾帧} as FeaturePage);
+  const endUrl = resolveSrc(end.图片);
+  const sw = endSwitchFrame(end, dur);
+  const switched = !!endUrl && frame >= sw;
+  // 讲解区域只在首帧上播放，切换到尾帧后就不再显示
+  const rec = recOf(fx);
+  const useSpots = !!url && spots.length > 0 && !switched;
 
   // 进场
   const enter: Record<PhoneFx['手机进场'], string> = {
@@ -574,7 +789,9 @@ const Phone: React.FC<{
       >
         {url ? (
           isVideo ? (
-            <OffthreadVideo src={url} muted style={{width: '100%', height: '100%', objectFit: 'cover'}} />
+            <div style={{position: 'absolute', inset: 0, ...camStyle}}>
+              <ScreenMedia url={url} isVideo rec={rec} style={{width: '100%', height: '100%'}} />
+            </div>
           ) : (
             <div style={{position: 'absolute', inset: 0, ...camStyle}}>
               <Img src={url} style={{width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'top'}} />
@@ -599,6 +816,7 @@ const Phone: React.FC<{
         ) : (
           <Placeholder label={label} hue={hue} style={{width: '100%', height: '100%'}} />
         )}
+        {endUrl && <EndFrameLayer url={endUrl} effect={end.切换} at={sw} />}
         {useSpots && fx.讲解效果 === '放大弹出' && fx.压暗背景 && <SpotDim n={spots.length} tm={tm} />}
         {useSpots && fx.讲解效果 === '描边闪烁' && spots.map((sp, i) => <SpotRing key={i} spot={sp} i={i} tm={tm} iw={iw} ih={ih} dim={fx.压暗背景} />)}
         {children}
@@ -607,10 +825,11 @@ const Phone: React.FC<{
         spots.map((sp, i) => (
           <React.Fragment key={i}>
             {fx.显示手指 && <Tap x={B + ((sp.左 + sp.宽 / 2) / 100) * iw} y={B + ((sp.上 + sp.高 / 2) / 100) * ih} at={tm.first + i * tm.every - 6} />}
-            {fx.讲解效果 === '放大弹出' && <SpotPop spot={sp} i={i} tm={tm} url={url!} iw={iw} ih={ih} />}
+            {fx.讲解效果 === '放大弹出' && <SpotPop spot={sp} i={i} tm={tm} url={url!} isVideo={isVideo} rec={rec} iw={iw} ih={ih} />}
             {fx.讲解效果 === '描边闪烁' && <RingLabel spot={sp} i={i} tm={tm} iw={iw} ih={ih} />}
           </React.Fragment>
         ))}
+      {endUrl && end.先点击 && <Tap x={B + (end.点击位置.左 / 100) * iw} y={B + (end.点击位置.上 / 100) * ih} at={sw - 8} />}
       {camSpot && (
         <div
           style={{
@@ -634,6 +853,23 @@ const Phone: React.FC<{
           {camSpot.文字}
         </div>
       )}
+    </div>
+  );
+};
+// 尾帧画面：在第 at 帧盖到首帧上面
+const EndFrameLayer: React.FC<{url: string; effect: EndFrame['切换']; at: number}> = ({url, effect, at}) => {
+  const frame = useCurrentFrame();
+  if (frame < at) return null;
+  const p = interpolate(frame, [at, at + 12], [0, 1], {...clamp, easing: Easing.out(Easing.cubic)});
+  const style: Record<EndFrame['切换'], React.CSSProperties> = {
+    淡入淡出: {opacity: p},
+    向左滑动: {transform: `translateX(${(1 - p) * 100}%)`, boxShadow: '-20px 0 40px rgba(0,0,0,.25)'},
+    向上滑动: {transform: `translateY(${(1 - p) * 100}%)`, boxShadow: '0 -20px 40px rgba(0,0,0,.25)'},
+    放大切换: {transform: `scale(${1.12 - 0.12 * p})`, opacity: p},
+  };
+  return (
+    <div style={{position: 'absolute', inset: 0, zIndex: 10, background: '#fff', ...style[effect]}}>
+      <Img src={url} style={{width: '100%', height: '100%', objectFit: 'cover', objectPosition: 'top'}} />
     </div>
   );
 };
@@ -857,7 +1093,7 @@ const End = () => {
    这里按每页的动作时间点排好：转场、点击、弹出、成功提示。 */
 type Cue = {at: number; name: string; gain?: number};
 const QUIET: Transition[] = ['淡入', '直接切换']; // 这两种转场不配「唰」的声音
-const sceneCues = (p: Props, sc: Scene): Cue[] => {
+export const sceneCues = (p: Props, sc: Scene): Cue[] => {
   if (sc.id === 'intro') return [{at: 2, name: 'pop'}];
   if (sc.id === 'end') return [{at: 6, name: 'chime'}];
   const pg = p.页面[sc.id];
@@ -865,13 +1101,18 @@ const sceneCues = (p: Props, sc: Scene): Cue[] => {
   if (pg.类型 === '卡片页') return [...enter('swipe'), ...pg.卡片.map((_, i) => ({at: 12 + i * 4, name: 'pop-soft'}))];
   const shot = pg.截图.trim();
   const tm = spotTiming(pg.讲解停留);
-  const spots: Cue[] =
-    shot && !/\.(mp4|mov|webm)$/i.test(shot)
-      ? pg.高亮.flatMap((_, i) => [...(pg.显示手指 ? [{at: tm.first + i * tm.every - 6, name: 'click'}] : []), {at: tm.first + i * tm.every, name: 'pop'}])
-      : [];
+  const spots: Cue[] = shot
+    ? pg.高亮.flatMap((_, i) => [...(pg.显示手指 ? [{at: tm.first + i * tm.every - 6, name: 'click'}] : []), {at: tm.first + i * tm.every, name: 'pop'}])
+    : [];
+  const end = endFrameOf(pg);
+  const sw = endSwitchFrame(end, sc.frames);
+  const endCues: Cue[] = end.图片.trim()
+    ? [...(end.先点击 ? [{at: sw - 8, name: 'click'}] : []), {at: sw, name: end.切换 === '淡入淡出' || end.切换 === '放大切换' ? 'pop-soft' : 'swipe'}]
+    : [];
   return [
     ...enter('whoosh'),
-    ...(shot ? spots : (MOCKS[pg.示意]?.cues ?? [])),
+    ...(shot ? spots.filter((c) => !end.图片.trim() || c.at < sw) : (MOCKS[pg.示意]?.cues ?? [])),
+    ...endCues,
     ...(pg.提示.开启
       ? [
           {at: 26, name: 'alert'},
@@ -879,6 +1120,17 @@ const sceneCues = (p: Props, sc: Scene): Cue[] => {
         ]
       : []),
   ];
+};
+
+// 整条视频的音效：第几帧、哪个音效、音量。控制台的预览播放器按它播放
+export const allSoundCues = (p: Props) => {
+  let from = 0;
+  const out: {frame: number; name: string; volume: number}[] = [];
+  for (const sc of scenesOf(p)) {
+    for (const c of sceneCues(p, sc)) out.push({frame: from + c.at, name: c.name, volume: p.样式.音效音量 * (c.gain ?? 1)});
+    from += sc.frames;
+  }
+  return out;
 };
 
 const Soundtrack = () => {

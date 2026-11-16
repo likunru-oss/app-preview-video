@@ -39,15 +39,15 @@ const startRender = () => {
   const name = `App预览视频-${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.mp4`;
   const out = path.join(root, 'out', name);
   job = {state: 'running', progress: 0, file: '', error: ''};
-  // 用当前这个 node 直接跑 Remotion 的入口脚本：Mac / Windows 都能用，也不依赖系统 PATH
-  const child = spawn(process.execPath, [path.join(root, 'node_modules/@remotion/cli/remotion-cli.js'), 'render', 'src/index.ts', 'AppPreview', out, '--props=src/settings.json'], {cwd: root});
+  // 用当前这个 node 跑导出脚本：把设置打包成合成页，交给 HyperFrames 逐帧渲染、混音、编码
+  const child = spawn(process.execPath, [path.join(root, 'render/render.mjs'), out], {cwd: root});
   let log = '';
   const onData = (b: Buffer) => {
     const text = b.toString();
     log = (log + text).slice(-4000);
-    const all = [...text.matchAll(/(?:Rendered|Encoded)\s+(\d+)\/(\d+)/g)];
+    const all = [...text.matchAll(/PROGRESS ([\d.]+)/g)];
     const last = all[all.length - 1];
-    if (last) job.progress = Math.max(job.progress, Math.min(0.99, Number(last[1]) / Number(last[2])));
+    if (last) job.progress = Math.max(job.progress, Math.min(0.99, Number(last[1])));
   };
   child.stdout.on('data', onData);
   child.stderr.on('data', onData);
@@ -103,14 +103,24 @@ const api = (): Plugin => ({
         res.end(JSON.stringify(data));
       };
       try {
-        if (url.pathname === '/props' && req.method === 'GET') return send(200, JSON.parse(fs.readFileSync(settingsFile, 'utf8')));
+        // 版本号 = 设置文件的修改时间。保存时带上「我是在哪个版本上改的」，
+        // 如果文件在这期间被别人（比如 Claude）改过，就拒绝保存，让页面重新读，免得覆盖掉对方的改动
+        const version = () => String(fs.statSync(settingsFile).mtimeMs);
+        if (url.pathname === '/props' && req.method === 'GET') {
+          res.setHeader('X-Version', version());
+          return send(200, JSON.parse(fs.readFileSync(settingsFile, 'utf8')));
+        }
+        if (url.pathname === '/version' && req.method === 'GET') return send(200, {version: version()});
         if (url.pathname === '/props' && req.method === 'POST') {
+          const base = req.headers['x-base-version'];
+          if (base && base !== version()) return send(409, {error: 'changed', version: version()});
           const data = JSON.parse((await readBody(req, 2e6)).toString('utf8'));
           fs.writeFileSync(settingsFile, JSON.stringify(data, null, 2));
-          return send(200, {ok: true});
+          return send(200, {ok: true, version: version()});
         }
         if (url.pathname === '/reset' && req.method === 'POST') {
           fs.copyFileSync(defaultsFile, settingsFile);
+          res.setHeader('X-Version', version());
           return send(200, JSON.parse(fs.readFileSync(settingsFile, 'utf8')));
         }
         if (url.pathname === '/upload' && req.method === 'POST') {
@@ -140,5 +150,5 @@ export default defineConfig({
   root: here,
   publicDir: path.join(root, 'public'),
   plugins: [react(), api()],
-  server: {port: 5173, strictPort: false, host: '127.0.0.1', watch: {ignored: ['**/public/**', '**/out/**', '**/src/settings*.json']}},
+  server: {port: 5173, strictPort: false, host: '127.0.0.1', watch: {ignored: ['**/public/**', '**/out/**', '**/composition/**', '**/src/settings*.json']}},
 });

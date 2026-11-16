@@ -18,7 +18,9 @@
 - **讲解区域**：在截图上框出几块位置，视频里手指会点它，然后用「放大弹出 / 镜头推近 / 描边闪烁」三种方式之一讲解，并配一句说明。
 - **转场**：上推、左推、右推、圆形扩散、三角推进、向下擦除、缩放、淡入、直接切换。
 - **动效**：标题（弹出、上滑、淡入、打字、逐字弹出）、手机进场（升起、滑入、放大、倾斜转正）和进场后的动态（缓慢放大、漂浮、摆动）、卡片动画、开场和结尾的 Logo 动画、整体的弹跳感。
-- **画面上的小动画**：先红后绿的两条提示（比如"No signal → Offline map"）；导航类截图里的车辆图标可以沿路线往前开。
+- **画面上的小动画**：先红后绿的两条提示（比如"No signal → Offline map"）；导航类截图里可以做「车不动、地图往车这边移动」的真实导航效果（可以标出不跟着动的卡片和按钮），也可以让车沿路线往前开。
+- **首帧 → 尾帧**：手机画面播到一半切换成第二张截图（操作前 → 操作后），可选切换方式和切换前的手指点击。
+- **录屏**：可以设从第几秒开始播、几倍速。
 - **音效**：点击、弹出、转场、成功提示等 8 种，全部是用代码合成的原创音频，没有第三方素材。
 
 **控制台**：本地运行的网页，左边实时预览视频，右边是当前页的设置。
@@ -48,7 +50,12 @@ git clone https://github.com/likunru-oss/app-preview-video.git "$env:USERPROFILE
 
 重新打开 Claude Code，skill 就会出现在可用列表里。
 
-**Node.js**：需要 18 以上。电脑上没有的话，Claude 会先征求你的同意，再从 nodejs.org 下载官方免安装版（校验 SHA-256），放在你自己的用户文件夹里，只给这个 skill 用，不改动系统、不需要管理员密码。
+**需要的运行环境**：Node.js 22 以上、FFmpeg（导出视频用）。电脑上缺哪样，Claude 会先告诉你要下载什么、多大，征求你的同意后再下载：
+
+- Node.js：从 nodejs.org 下载官方免安装版，校验官方公布的 SHA-256。
+- FFmpeg：从 GitHub 上 [eugeneware/ffmpeg-static](https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1) 下载静态编译版（FFmpeg 6.0），校验 GitHub 公布的 SHA-256。
+
+都放在你自己的用户文件夹里，只给这个 skill 用，不改动系统、不需要管理员密码。导出时会用电脑上已装的 Google Chrome 截图；没有 Chrome 的话，渲染器 HyperFrames 第一次导出时会自动下载一份浏览器（约 270MB）。
 
 ## 使用
 
@@ -73,20 +80,22 @@ SKILL.md                 给 Claude 看的说明：流程、注意事项、常�
 references/settings.md   每个设置项的含义
 scripts/                 新建工程的脚本（Mac/Linux 用 .sh，Windows 用 .ps1）
 assets/template/         工程模板
-  src/AppPreview.tsx       视频本身（Remotion + React）
+  src/AppPreview.tsx       视频本身（React）
+  src/engine.tsx           自己写的小动画引擎：帧号、插值、弹簧、时间段、录屏、音效
   src/settings.json        所有可调内容，控制台读写的就是它
-  control/                 控制台（Vite + React）
+  control/                 控制台（Vite + React），player.tsx 是预览播放器
+  render/                  导出：打包成合成页，交给 HyperFrames 逐帧渲染、FFmpeg 编码
   public/sfx/              合成音效；tools/make_sfx.py 可以重新生成
 docs/                    README 里的图片
 ```
 
 ## 需要知道的事
 
-- **Remotion 的许可证。** 视频引擎 [Remotion](https://www.remotion.dev) 不是 MIT 协议：个人、3 人以内的公司和非营利组织可以免费用（包括商用），规模更大的营利公司需要购买 [公司许可](https://www.remotion.dev/license)。这个仓库不包含 Remotion 的代码，安装依赖时才会从 npm 下载，但你用它做视频时要遵守它的许可。
+- **不依赖 Remotion。** 早期版本用 Remotion 做视频引擎，它对 3 人以上的营利公司要求购买许可。现在动画由仓库里自己写的 `src/engine.tsx` 驱动，导出用 HeyGen 开源的 [HyperFrames](https://github.com/heygen-com/hyperframes)（Apache-2.0），公司商用不需要额外许可。HyperFrames 的使用统计在导出脚本里默认关闭。
 - **用真实界面。** 苹果要求预览视频以 App 内的真实画面为主。控制台里的动效是包装，手机里应该放真实的截图或录屏。
 - **Windows 还没实测。** 安装脚本和启动器按 Windows 的规则写好了，但目前只在 macOS 上完整测试过。遇到问题欢迎提 issue。
 - **其他商店和机型。** 模板是 6.9 英寸 iPhone 的尺寸。其他机型或 Google Play 的规格不同，提交前请对照官方要求。
 
 ## 许可证
 
-本仓库的代码、文档和合成音效以 [Apache License 2.0](LICENSE) 发布。依赖的第三方库（包括 Remotion）遵循各自的许可证。
+本仓库的代码、文档和合成音效以 [Apache License 2.0](LICENSE) 发布。依赖的第三方库（包括 HyperFrames、FFmpeg）遵循各自的许可证。
