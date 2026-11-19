@@ -39,13 +39,13 @@
 **Mac / Linux**
 
 ```bash
-git clone https://github.com/likunru-oss/app-preview-video.git ~/.claude/skills/app-preview-video
+git clone https://github.com/DirectorKun/app-preview-video.git ~/.claude/skills/app-preview-video
 ```
 
 **Windows（PowerShell）**
 
 ```powershell
-git clone https://github.com/likunru-oss/app-preview-video.git "$env:USERPROFILE\.claude\skills\app-preview-video"
+git clone https://github.com/DirectorKun/app-preview-video.git "$env:USERPROFILE\.claude\skills\app-preview-video"
 ```
 
 重新打开 Claude Code，skill 就会出现在可用列表里。
